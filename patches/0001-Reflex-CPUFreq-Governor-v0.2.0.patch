@@ -1,20 +1,20 @@
-From 60da4c98c22725dd5c43a82966602203f5b9582a Mon Sep 17 00:00:00 2001
+From 1e3d47126e46dd1fe49df6565005e199c1bf6e95 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 17 Feb 2026 02:16:54 +0900
-Subject: [PATCH] Reflex CPUFreq Governor v0.1.0
+Date: Thu, 19 Feb 2026 04:51:35 +0900
+Subject: [PATCH] Reflex CPUFreq Governor v0.2.0
 
 ---
- arch/x86/kernel/cpu/aperfmperf.c |   1 +
- drivers/cpufreq/Kconfig          |  24 +
- drivers/cpufreq/Makefile         |   1 +
- drivers/cpufreq/cpufreq.c        |   3 +
- drivers/cpufreq/cpufreq_reflex.c | 945 +++++++++++++++++++++++++++++++
- include/linux/sched/cpufreq.h    |  10 +
- kernel/kthread.c                 |   1 +
- kernel/sched/cpufreq.c           |   1 +
- kernel/sched/cpufreq_schedutil.c |  76 +++
- kernel/time/tick-sched.c         |   1 +
- 10 files changed, 1063 insertions(+)
+ arch/x86/kernel/cpu/aperfmperf.c |    1 +
+ drivers/cpufreq/Kconfig          |   24 +
+ drivers/cpufreq/Makefile         |    1 +
+ drivers/cpufreq/cpufreq.c        |    3 +
+ drivers/cpufreq/cpufreq_reflex.c | 1018 ++++++++++++++++++++++++++++++
+ include/linux/sched/cpufreq.h    |   10 +
+ kernel/kthread.c                 |    1 +
+ kernel/sched/cpufreq.c           |    1 +
+ kernel/sched/cpufreq_schedutil.c |   76 +++
+ kernel/time/tick-sched.c         |    1 +
+ 10 files changed, 1136 insertions(+)
  create mode 100644 drivers/cpufreq/cpufreq_reflex.c
 
 diff --git a/arch/x86/kernel/cpu/aperfmperf.c b/arch/x86/kernel/cpu/aperfmperf.c
@@ -106,24 +106,30 @@ index 852e024fac..a73a87fbca 100644
  static int __target_intermediate(struct cpufreq_policy *policy,
 diff --git a/drivers/cpufreq/cpufreq_reflex.c b/drivers/cpufreq/cpufreq_reflex.c
 new file mode 100644
-index 0000000000..2edf858962
+index 0000000000..9a5efb7ab0
 --- /dev/null
 +++ b/drivers/cpufreq/cpufreq_reflex.c
-@@ -0,0 +1,945 @@
+@@ -0,0 +1,1018 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Reflex CPUFreq governor (based on schedutil)
 + * Copyright (C) 2026 Masahito Suzuki
 + *
-+ * schedutil + idle-time accounting based hispeed floor.
-+ * Frequency scaling is identical to schedutil except for the hispeed
-+ * floor: on each observation window, real CPU busy% is measured from
-+ * kcpustat idle-time counters and used as a frequency floor
-+ * (floor = max_freq × busy_pct / 100).  This bridges the PELT
-+ * convergence gap (~32 ms) after wakeup, providing immediate high
-+ * frequency for bursty workloads.  Once PELT converges, its 1.25×
-+ * headroom makes proportional scaling >= floor, so the floor becomes
-+ * transparent.
++ * schedutil + idle-time accounting based hispeed floor with PELT-
++ * complementary exponential decay.
++ *
++ * Frequency scaling is identical to schedutil (including the 1.25×
++ * DVFS headroom) except for the hispeed blend:
++ *
++ * On each observation window, real CPU busy% is measured from
++ * kcpustat idle-time counters.  This is blended with PELT util:
++ *
++ *   blended = pelt + (hispeed - pelt) >> half_lives
++ *
++ * The blend decays with PELT's 32 ms half-life: every 32 ms, the
++ * hispeed contribution halves while PELT fills the same gap,
++ * keeping total coverage at ~100%.  After ~320 ms hispeed is
++ * negligible and PELT-based proportional scaling takes full control.
 + */
 +
 +#include <linux/cpufreq.h>
@@ -148,13 +154,13 @@ index 0000000000..2edf858962
 +#define CPUFREQ_REFLEX_PROGNAME "Reflex CPUFreq Governor"
 +#define CPUFREQ_REFLEX_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUFREQ_REFLEX_VERSION  "0.1.0"
++#define CPUFREQ_REFLEX_VERSION  "0.2.0"
 +
 +/**************************************************************
 + * Default tunables
 + */
-+#define CPUFREQ_REFLEX_DEFAULT_HISPEED_WINDOW_US   6000
-+#define CPUFREQ_REFLEX_DEFAULT_IO_BOOST_ENABLED       1
++#define CPUFREQ_REFLEX_DEFAULT_HISPEED_WINDOW_US   4000
++#define CPUFREQ_REFLEX_DEFAULT_HISPEED_FILTER_SHIFT   3
 +
 +
 +/* SCHED_FLAG_SUGOV is private to kernel/sched/sched.h; hardcode here. */
@@ -165,8 +171,8 @@ index 0000000000..2edf858962
 +struct rfx_tunables {
 +	struct gov_attr_set	attr_set;
 +	unsigned int		rate_limit_us;
-+	unsigned int		hispeed_window_us;  /* observation window (usec) */
-+	unsigned int		io_boost_enabled;
++	unsigned int		hispeed_window_us;    /* observation window (usec) */
++	unsigned int		hispeed_filter_shift; /* EWMA down-ramp shift (0=off) */
 +};
 +
 +struct rfx_policy {
@@ -210,7 +216,10 @@ index 0000000000..2edf858962
 +	u64			prev_idle_time;
 +	u64			prev_wall_time;
 +	unsigned int		busy_pct;
++	unsigned int		filtered_busy_pct;
 +	bool			hispeed_active;
++	u64			hispeed_start_ns;
++	unsigned int		hispeed_idle_windows;
 +
 +	/* The field below is for single-CPU policies only: */
 +#ifdef CONFIG_NO_HZ_COMMON
@@ -269,9 +278,6 @@ index 0000000000..2edf858962
 +	}
 +}
 +
-+/*
-+ * Compute the next frequency using schedutil's linear mapping.
-+ */
 +static unsigned int rfx_get_next_freq(struct rfx_policy *rfx_pol,
 +				      unsigned long util, unsigned long max)
 +{
@@ -304,21 +310,23 @@ index 0000000000..2edf858962
 + * This gives the raw CPU busy ratio without PELT smoothing.
 + */
 +static void rfx_update_busy_pct(struct rfx_cpu *rfx_c,
-+				unsigned int window_us, int io_busy)
++				unsigned int window_us,
++				unsigned int filter_shift, u64 time)
 +{
 +	u64 cur_idle, cur_wall;
 +	unsigned int wall_delta, idle_delta;
 +
-+	cur_idle = get_cpu_idle_time(rfx_c->cpu, &cur_wall, io_busy);
++	cur_idle = get_cpu_idle_time(rfx_c->cpu, &cur_wall, 1);
 +	wall_delta = (unsigned int)(cur_wall - rfx_c->prev_wall_time);
 +
 +	if (wall_delta >= window_us) {
 +		/*
-+		 * Window expired.  Reset busy_pct to 0 and set
-+		 * hispeed_active so the next callback performs an
-+		 * immediate measurement.  If the CPU stays busy, the
-+		 * next measurement will set busy_pct ~100; if it goes
-+		 * idle before the next callback, busy_pct stays 0.
++		 * Phase 1: Window expired.  Reset busy_pct and request
++		 * an immediate measurement on the next callback.
++		 *
++		 * Do NOT touch hispeed_start_ns or hispeed_idle_windows
++		 * here: the momentary busy_pct=0 is a two-phase
++		 * measurement artifact, not a genuine idle signal.
 +		 */
 +		rfx_c->busy_pct = 0;
 +		rfx_c->hispeed_active = true;
@@ -334,6 +342,7 @@ index 0000000000..2edf858962
 +	if (!rfx_c->hispeed_active)
 +		return;
 +
++	/* Phase 2: immediate post-reset measurement. */
 +	rfx_c->hispeed_active = false;
 +
 +	if (cur_idle > rfx_c->prev_idle_time)
@@ -348,22 +357,85 @@ index 0000000000..2edf858962
 +
 +	rfx_c->prev_idle_time = cur_idle;
 +	rfx_c->prev_wall_time = cur_wall;
++
++	/*
++	 * Asymmetric EWMA filter on busy_pct:
++	 *   Up:   instant tracking  (filtered = measured)
++	 *   Down: slow ramp-down    (filtered -= (filtered - measured) >> shift)
++	 *
++	 * shift=0 disables the filter.  Higher shift = slower decay.
++	 */
++	if (!filter_shift || rfx_c->busy_pct >= rfx_c->filtered_busy_pct) {
++		rfx_c->filtered_busy_pct = rfx_c->busy_pct;
++	} else {
++		rfx_c->filtered_busy_pct -=
++			(rfx_c->filtered_busy_pct - rfx_c->busy_pct)
++			>> filter_shift;
++	}
++
++	/*
++	 * Hispeed decay timer tracking with one-window grace period.
++	 *
++	 * The decay timer (hispeed_start_ns) is only reset after two
++	 * consecutive idle windows.  This prevents rapid idle/busy
++	 * spinning from constantly resetting the timer, which would
++	 * keep the hispeed weight at 1.0 and defeat decay.
++	 */
++	if (rfx_c->filtered_busy_pct > 0) {
++		rfx_c->hispeed_idle_windows = 0;
++		if (!rfx_c->hispeed_start_ns)
++			rfx_c->hispeed_start_ns = time;
++	} else {
++		rfx_c->hispeed_idle_windows++;
++		if (rfx_c->hispeed_idle_windows >= 2) {
++			rfx_c->hispeed_start_ns = 0;
++			rfx_c->filtered_busy_pct = 0;
++		}
++	}
 +}
 +
 +/*
-+ * Compute hispeed frequency floor.
++ * Blend PELT utilization with hispeed utilization using PELT-complementary
++ * exponential decay.
 + *
-+ * floor = max_freq × busy_pct / 100.  No threshold — the floor is
-+ * always proportional to idle-time busy%.  During PELT convergence
-+ * (first ~32 ms after wakeup) this raises frequency above what
-+ * proportional scaling would give.  Once PELT converges, its 1.25×
-+ * headroom makes proportional freq >= floor, so the floor becomes
-+ * transparent.
++ *   w = 2^(-half_lives)          [decays with PELT's 32 ms half-life]
++ *   blended = pelt + w × (hispeed - pelt)
++ *           = pelt + (hispeed - pelt) >> half_lives
++ *
++ * hispeed_util = max_cap × filtered_busy_pct / 100  [EWMA-filtered]
++ *
++ * This ensures that at any point in time:
++ *
++ *   PELT coverage + hispeed coverage ≈ 100%
++ *
++ * When hispeed_util <= pelt_util, hispeed is transparent.
++ * After 10 half-lives (320 ms), the hispeed contribution is negligible.
 + */
-+static unsigned int rfx_hispeed_floor(struct rfx_policy *rfx_pol,
-+				      unsigned int busy_pct)
++#define HISPEED_HALFLIFE_NS	(32 * NSEC_PER_MSEC)
++
++static unsigned long rfx_blend_util(struct rfx_cpu *rfx_c,
++				    unsigned long pelt_util,
++				    unsigned long max_cap,
++				    u64 time)
 +{
-+	return rfx_pol->policy->max * busy_pct / 100;
++	unsigned long hispeed_util;
++	unsigned int half_lives;
++
++	if (!rfx_c->filtered_busy_pct || !rfx_c->hispeed_start_ns)
++		return pelt_util;
++
++	hispeed_util = max_cap * rfx_c->filtered_busy_pct / 100;
++
++	if (hispeed_util <= pelt_util)
++		return pelt_util;
++
++	half_lives = (unsigned int)((time - rfx_c->hispeed_start_ns)
++				    / HISPEED_HALFLIFE_NS);
++	if (half_lives >= 10)
++		return pelt_util;
++
++	return min(pelt_util + ((hispeed_util - pelt_util) >> half_lives),
++		   max_cap);
 +}
 +
 +/************************ I/O wait boost ***********************/
@@ -469,13 +541,11 @@ index 0000000000..2edf858962
 +	struct rfx_tunables *tunables = rfx_pol->tunables;
 +	unsigned int cached_freq = rfx_pol->cached_raw_freq;
 +	unsigned long max_cap, boost, effective_util;
-+	unsigned int next_f, floor;
++	unsigned int next_f;
 +
 +	max_cap = arch_scale_cpu_capacity(rfx_c->cpu);
 +
-+	/* I/O wait boost handling (schedutil-compatible) */
-+	if (tunables->io_boost_enabled)
-+		rfx_iowait_boost(rfx_c, time, flags);
++	rfx_iowait_boost(rfx_c, time, flags);
 +	rfx_c->last_update = time;
 +
 +	rfx_ignore_dl_rate_limit(rfx_c);
@@ -483,23 +553,17 @@ index 0000000000..2edf858962
 +	if (!rfx_should_update_freq(rfx_pol, time))
 +		return;
 +
-+	/* Get I/O boost and raw utilization (schedutil-identical) */
-+	boost = tunables->io_boost_enabled ?
-+		rfx_iowait_apply(rfx_c, time, max_cap) : 0;
++	boost = rfx_iowait_apply(rfx_c, time, max_cap);
 +	rfx_get_util(rfx_c, boost);
 +	effective_util = max(rfx_c->util, boost);
 +
-+	/* Update idle-time based busy% */
++	/* Blend PELT util with hispeed util (decayed by PELT half-life) */
 +	rfx_update_busy_pct(rfx_c, tunables->hispeed_window_us,
-+			    tunables->io_boost_enabled);
++			    tunables->hispeed_filter_shift, time);
++	effective_util = rfx_blend_util(rfx_c, effective_util, max_cap, time);
 +
 +	/* Proportional scaling (schedutil-identical) */
 +	next_f = rfx_get_next_freq(rfx_pol, effective_util, max_cap);
-+
-+	/* Hispeed floor: measured busy% × max_freq */
-+	floor = rfx_hispeed_floor(rfx_pol, rfx_c->busy_pct);
-+	if (floor > next_f)
-+		next_f = floor;
 +
 +	/* Hold frequency if CPU has not been idle (schedutil-identical) */
 +	if (rfx_hold_freq(rfx_c) && next_f < rfx_pol->next_freq &&
@@ -536,8 +600,7 @@ index 0000000000..2edf858962
 +
 +	max_cap = arch_scale_cpu_capacity(rfx_c->cpu);
 +
-+	if (tunables->io_boost_enabled)
-+		rfx_iowait_boost(rfx_c, time, flags);
++	rfx_iowait_boost(rfx_c, time, flags);
 +	rfx_c->last_update = time;
 +
 +	rfx_ignore_dl_rate_limit(rfx_c);
@@ -545,24 +608,26 @@ index 0000000000..2edf858962
 +	if (!rfx_should_update_freq(rfx_pol, time))
 +		return;
 +
-+	boost = tunables->io_boost_enabled ?
-+		rfx_iowait_apply(rfx_c, time, max_cap) : 0;
++	/*
++	 * Clear need_freq_update here because the perf path does not call
++	 * rfx_update_next_freq() which normally clears it.  Without this,
++	 * need_freq_update stays true forever on drivers that set
++	 * CPUFREQ_NEED_UPDATE_LIMITS (e.g. Intel HWP, AMD pstate), causing
++	 * rfx_should_update_freq() to permanently bypass rate limiting.
++	 * That in turn makes hispeed busy% measurements run over sub-tick
++	 * intervals where the CPU is always executing, inflating busy_pct
++	 * to ~100% and locking the hispeed floor at max_freq.
++	 */
++	rfx_pol->need_freq_update = false;
++
++	boost = rfx_iowait_apply(rfx_c, time, max_cap);
 +	rfx_get_util(rfx_c, boost);
 +	rfx_c->util = max(rfx_c->util, boost);
 +
-+	/* Hispeed floor: convert frequency floor to util value */
++	/* Blend PELT util with hispeed util (decayed by PELT half-life) */
 +	rfx_update_busy_pct(rfx_c, tunables->hispeed_window_us,
-+			    tunables->io_boost_enabled);
-+	{
-+		unsigned int floor_freq = rfx_hispeed_floor(rfx_pol, rfx_c->busy_pct);
-+
-+		if (floor_freq) {
-+			unsigned long hispeed_util =
-+				(unsigned long)max_cap * floor_freq /
-+				rfx_pol->policy->cpuinfo.max_freq;
-+			rfx_c->util = max(rfx_c->util, hispeed_util);
-+		}
-+	}
++			    tunables->hispeed_filter_shift, time);
++	rfx_c->util = rfx_blend_util(rfx_c, rfx_c->util, max_cap, time);
 +
 +	if (rfx_hold_freq(rfx_c) && rfx_c->util < prev_util)
 +		rfx_c->util = prev_util;
@@ -581,8 +646,7 @@ index 0000000000..2edf858962
 +	struct rfx_tunables *tunables = rfx_pol->tunables;
 +	struct cpufreq_policy *policy = rfx_pol->policy;
 +	unsigned long util = 0, max_cap;
-+	unsigned int busy_max = 0, next_f, floor;
-+	unsigned int j;
++	unsigned int next_f, j;
 +
 +	max_cap = arch_scale_cpu_capacity(rfx_c->cpu);
 +
@@ -590,23 +654,18 @@ index 0000000000..2edf858962
 +		struct rfx_cpu *j_rfx_c = &per_cpu(rfx_cpu, j);
 +		unsigned long j_boost, j_util;
 +
-+		j_boost = tunables->io_boost_enabled ?
-+			rfx_iowait_apply(j_rfx_c, time, max_cap) : 0;
++		j_boost = rfx_iowait_apply(j_rfx_c, time, max_cap);
 +		rfx_get_util(j_rfx_c, j_boost);
 +		j_util = max(j_rfx_c->util, j_boost);
-+		util = max(j_util, util);
 +
 +		rfx_update_busy_pct(j_rfx_c, tunables->hispeed_window_us,
-+				    tunables->io_boost_enabled);
-+		busy_max = max(j_rfx_c->busy_pct, busy_max);
++				    tunables->hispeed_filter_shift, time);
++		j_util = rfx_blend_util(j_rfx_c, j_util, max_cap, time);
++
++		util = max(j_util, util);
 +	}
 +
 +	next_f = rfx_get_next_freq(rfx_pol, util, max_cap);
-+
-+	/* Hispeed floor: measured busy% × max_freq */
-+	floor = rfx_hispeed_floor(rfx_pol, busy_max);
-+	if (floor > next_f)
-+		next_f = floor;
 +
 +	return next_f;
 +}
@@ -621,8 +680,7 @@ index 0000000000..2edf858962
 +
 +	raw_spin_lock(&rfx_pol->update_lock);
 +
-+	if (tunables->io_boost_enabled)
-+		rfx_iowait_boost(rfx_c, time, flags);
++	rfx_iowait_boost(rfx_c, time, flags);
 +	rfx_c->last_update = time;
 +
 +	rfx_ignore_dl_rate_limit(rfx_c);
@@ -728,13 +786,20 @@ index 0000000000..2edf858962
 +static struct governor_attr rfx_rate_limit_us =
 +	__ATTR(rate_limit_us, 0644, rfx_rate_limit_us_show, rfx_rate_limit_us_store);
 +
++static ssize_t version_show(struct gov_attr_set *attr_set, char *buf)
++{
++	return sprintf(buf, "%s\n", CPUFREQ_REFLEX_VERSION);
++}
++static struct governor_attr version = __ATTR_RO(version);
++
 +RFX_TUNABLE_UINT(hispeed_window_us);
-+RFX_TUNABLE_UINT(io_boost_enabled);
++RFX_TUNABLE_UINT(hispeed_filter_shift);
 +
 +static struct attribute *rfx_attrs[] = {
++	&version.attr,
 +	&rfx_rate_limit_us.attr,
 +	&hispeed_window_us.attr,
-+	&io_boost_enabled.attr,
++	&hispeed_filter_shift.attr,
 +	NULL
 +};
 +ATTRIBUTE_GROUPS(rfx);
@@ -860,9 +925,6 @@ index 0000000000..2edf858962
 +
 +static int rfx_init(struct cpufreq_policy *policy)
 +{
-+	printk(KERN_INFO "%s %s by %s\n", CPUFREQ_REFLEX_PROGNAME,
-+		CPUFREQ_REFLEX_VERSION, CPUFREQ_REFLEX_AUTHOR);
-+
 +	struct rfx_policy *rfx_pol;
 +	struct rfx_tunables *tunables;
 +	int ret = 0;
@@ -906,7 +968,7 @@ index 0000000000..2edf858962
 +	/* Default tunable values */
 +	tunables->rate_limit_us = cpufreq_policy_transition_delay_us(policy);
 +	tunables->hispeed_window_us = CPUFREQ_REFLEX_DEFAULT_HISPEED_WINDOW_US;
-+	tunables->io_boost_enabled = CPUFREQ_REFLEX_DEFAULT_IO_BOOST_ENABLED;
++	tunables->hispeed_filter_shift = CPUFREQ_REFLEX_DEFAULT_HISPEED_FILTER_SHIFT;
 +
 +	policy->governor_data = rfx_pol;
 +	rfx_pol->tunables = tunables;
@@ -993,8 +1055,7 @@ index 0000000000..2edf858962
 +		rfx_c->rfx_policy = rfx_pol;
 +		/* Initialize idle-time baseline for hispeed busy% */
 +		rfx_c->prev_idle_time = get_cpu_idle_time(cpu,
-+					&rfx_c->prev_wall_time,
-+					rfx_pol->tunables->io_boost_enabled);
++					&rfx_c->prev_wall_time, 1);
 +		cpufreq_add_update_util_hook(cpu, &rfx_c->update_util, uu);
 +	}
 +	return 0;
@@ -1049,8 +1110,20 @@ index 0000000000..2edf858962
 +}
 +#endif
 +
-+cpufreq_governor_init(reflex_gov);
-+cpufreq_governor_exit(reflex_gov);
++static int __init reflex_gov_init(void)
++{
++	pr_info("%s %s by %s\n", CPUFREQ_REFLEX_PROGNAME,
++		CPUFREQ_REFLEX_VERSION, CPUFREQ_REFLEX_AUTHOR);
++	return cpufreq_register_governor(&reflex_gov);
++}
++
++static void __exit reflex_gov_exit(void)
++{
++	cpufreq_unregister_governor(&reflex_gov);
++}
++
++module_init(reflex_gov_init);
++module_exit(reflex_gov_exit);
 +
 +MODULE_AUTHOR(CPUFREQ_REFLEX_AUTHOR);
 +MODULE_LICENSE("GPL");
