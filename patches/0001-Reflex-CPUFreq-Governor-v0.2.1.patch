@@ -1,20 +1,20 @@
-From 1e3d47126e46dd1fe49df6565005e199c1bf6e95 Mon Sep 17 00:00:00 2001
+From 1444967382e3d41000771a0e87b74abbd6a21200 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 19 Feb 2026 04:51:35 +0900
-Subject: [PATCH] Reflex CPUFreq Governor v0.2.0
+Date: Thu, 19 Feb 2026 09:14:33 +0900
+Subject: [PATCH] Reflex CPUFreq Governor v0.2.1
 
 ---
  arch/x86/kernel/cpu/aperfmperf.c |    1 +
  drivers/cpufreq/Kconfig          |   24 +
  drivers/cpufreq/Makefile         |    1 +
  drivers/cpufreq/cpufreq.c        |    3 +
- drivers/cpufreq/cpufreq_reflex.c | 1018 ++++++++++++++++++++++++++++++
+ drivers/cpufreq/cpufreq_reflex.c | 1021 ++++++++++++++++++++++++++++++
  include/linux/sched/cpufreq.h    |   10 +
  kernel/kthread.c                 |    1 +
  kernel/sched/cpufreq.c           |    1 +
  kernel/sched/cpufreq_schedutil.c |   76 +++
  kernel/time/tick-sched.c         |    1 +
- 10 files changed, 1136 insertions(+)
+ 10 files changed, 1139 insertions(+)
  create mode 100644 drivers/cpufreq/cpufreq_reflex.c
 
 diff --git a/arch/x86/kernel/cpu/aperfmperf.c b/arch/x86/kernel/cpu/aperfmperf.c
@@ -106,10 +106,10 @@ index 852e024fac..a73a87fbca 100644
  static int __target_intermediate(struct cpufreq_policy *policy,
 diff --git a/drivers/cpufreq/cpufreq_reflex.c b/drivers/cpufreq/cpufreq_reflex.c
 new file mode 100644
-index 0000000000..9a5efb7ab0
+index 0000000000..b6c2f8755f
 --- /dev/null
 +++ b/drivers/cpufreq/cpufreq_reflex.c
-@@ -0,0 +1,1018 @@
+@@ -0,0 +1,1021 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Reflex CPUFreq governor (based on schedutil)
@@ -154,7 +154,7 @@ index 0000000000..9a5efb7ab0
 +#define CPUFREQ_REFLEX_PROGNAME "Reflex CPUFreq Governor"
 +#define CPUFREQ_REFLEX_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUFREQ_REFLEX_VERSION  "0.2.0"
++#define CPUFREQ_REFLEX_VERSION  "0.2.1"
 +
 +/**************************************************************
 + * Default tunables
@@ -368,9 +368,13 @@ index 0000000000..9a5efb7ab0
 +	if (!filter_shift || rfx_c->busy_pct >= rfx_c->filtered_busy_pct) {
 +		rfx_c->filtered_busy_pct = rfx_c->busy_pct;
 +	} else {
-+		rfx_c->filtered_busy_pct -=
++		unsigned int step =
 +			(rfx_c->filtered_busy_pct - rfx_c->busy_pct)
 +			>> filter_shift;
++		if (step)
++			rfx_c->filtered_busy_pct -= step;
++		else
++			rfx_c->filtered_busy_pct = rfx_c->busy_pct;
 +	}
 +
 +	/*
@@ -675,7 +679,6 @@ index 0000000000..9a5efb7ab0
 +{
 +	struct rfx_cpu *rfx_c = container_of(hook, struct rfx_cpu, update_util);
 +	struct rfx_policy *rfx_pol = rfx_c->rfx_policy;
-+	struct rfx_tunables *tunables = rfx_pol->tunables;
 +	unsigned int next_f;
 +
 +	raw_spin_lock(&rfx_pol->update_lock);
