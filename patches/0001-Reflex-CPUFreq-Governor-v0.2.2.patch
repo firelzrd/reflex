@@ -1,7 +1,7 @@
-From 1444967382e3d41000771a0e87b74abbd6a21200 Mon Sep 17 00:00:00 2001
+From ba9ab79e907e46bacf267815694a66c754b0303c Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 19 Feb 2026 09:14:33 +0900
-Subject: [PATCH] Reflex CPUFreq Governor v0.2.1
+Date: Mon, 23 Feb 2026 13:27:30 +0900
+Subject: [PATCH] Reflex CPUFreq Governor v0.2.2
 
 ---
  arch/x86/kernel/cpu/aperfmperf.c |    1 +
@@ -106,7 +106,7 @@ index 852e024fac..a73a87fbca 100644
  static int __target_intermediate(struct cpufreq_policy *policy,
 diff --git a/drivers/cpufreq/cpufreq_reflex.c b/drivers/cpufreq/cpufreq_reflex.c
 new file mode 100644
-index 0000000000..b6c2f8755f
+index 0000000000..be8da09e79
 --- /dev/null
 +++ b/drivers/cpufreq/cpufreq_reflex.c
 @@ -0,0 +1,1021 @@
@@ -154,13 +154,13 @@ index 0000000000..b6c2f8755f
 +#define CPUFREQ_REFLEX_PROGNAME "Reflex CPUFreq Governor"
 +#define CPUFREQ_REFLEX_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUFREQ_REFLEX_VERSION  "0.2.1"
++#define CPUFREQ_REFLEX_VERSION  "0.2.2"
 +
 +/**************************************************************
 + * Default tunables
 + */
 +#define CPUFREQ_REFLEX_DEFAULT_HISPEED_WINDOW_US   4000
-+#define CPUFREQ_REFLEX_DEFAULT_HISPEED_FILTER_SHIFT   3
++#define CPUFREQ_REFLEX_DEFAULT_HISPEED_FILTER_SHIFT   1
 +
 +
 +/* SCHED_FLAG_SUGOV is private to kernel/sched/sched.h; hardcode here. */
