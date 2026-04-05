@@ -1,20 +1,20 @@
-From ba9ab79e907e46bacf267815694a66c754b0303c Mon Sep 17 00:00:00 2001
+From e2f05d323c359e67fb4f690b2d16639d5969b0b2 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 23 Feb 2026 13:27:30 +0900
-Subject: [PATCH] Reflex CPUFreq Governor v0.2.2
+Date: Sun, 5 Apr 2026 07:31:35 +0900
+Subject: [PATCH] Reflex CPUFreq Governor v0.3.0r2
 
 ---
  arch/x86/kernel/cpu/aperfmperf.c |    1 +
  drivers/cpufreq/Kconfig          |   24 +
  drivers/cpufreq/Makefile         |    1 +
  drivers/cpufreq/cpufreq.c        |    3 +
- drivers/cpufreq/cpufreq_reflex.c | 1021 ++++++++++++++++++++++++++++++
+ drivers/cpufreq/cpufreq_reflex.c | 1141 ++++++++++++++++++++++++++++++
  include/linux/sched/cpufreq.h    |   10 +
  kernel/kthread.c                 |    1 +
  kernel/sched/cpufreq.c           |    1 +
- kernel/sched/cpufreq_schedutil.c |   76 +++
+ kernel/sched/cpufreq_schedutil.c |   76 ++
  kernel/time/tick-sched.c         |    1 +
- 10 files changed, 1139 insertions(+)
+ 10 files changed, 1259 insertions(+)
  create mode 100644 drivers/cpufreq/cpufreq_reflex.c
 
 diff --git a/arch/x86/kernel/cpu/aperfmperf.c b/arch/x86/kernel/cpu/aperfmperf.c
@@ -106,10 +106,10 @@ index 852e024fac..a73a87fbca 100644
  static int __target_intermediate(struct cpufreq_policy *policy,
 diff --git a/drivers/cpufreq/cpufreq_reflex.c b/drivers/cpufreq/cpufreq_reflex.c
 new file mode 100644
-index 0000000000..be8da09e79
+index 0000000000..68440141a4
 --- /dev/null
 +++ b/drivers/cpufreq/cpufreq_reflex.c
-@@ -0,0 +1,1021 @@
+@@ -0,0 +1,1141 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Reflex CPUFreq governor (based on schedutil)
@@ -154,7 +154,7 @@ index 0000000000..be8da09e79
 +#define CPUFREQ_REFLEX_PROGNAME "Reflex CPUFreq Governor"
 +#define CPUFREQ_REFLEX_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUFREQ_REFLEX_VERSION  "0.2.2"
++#define CPUFREQ_REFLEX_VERSION  "0.3.0"
 +
 +/**************************************************************
 + * Default tunables
@@ -219,6 +219,7 @@ index 0000000000..be8da09e79
 +	unsigned int		filtered_busy_pct;
 +	bool			hispeed_active;
 +	u64			hispeed_start_ns;
++	s32			log_hispeed;	  /* hispeed_util in log32fpmax_corr */
 +	unsigned int		hispeed_idle_windows;
 +
 +	/* The field below is for single-CPU policies only: */
@@ -228,6 +229,115 @@ index 0000000000..be8da09e79
 +};
 +
 +static DEFINE_PER_CPU(struct rfx_cpu, rfx_cpu);
++
++/*
++ * Minimal intfp log-domain helpers for hispeed decay.
++ * Specialized from intfp.h (v1.4) for u32 <-> log32fpmax_corr.
++ *
++ * log32fpmax for u32: sign=1, exponent=5, mantissa(ofp)=26 bits.
++ * log2(0.97857206) = -1/32 = -2097152 in Q5.26 fixed-point.
++ */
++#define RFX_LOG_OFP		26
++#define RFX_LOG_0		S32_MIN
++#define RFX_LOG_DECAY_PER_MS	(-2097152)	/* log2(0.97857206) in Q5.26 */
++#define RFX_LOG_DECAY_MAX_MS	320		/* 10 half-lives */
++
++static const u16 rfx_enc_corr_lut[256] = {
++	    0,    89,   177,   264,   350,   436,   521,   606,   690,   773,   855,   937,  1018,  1098,  1178,  1257,
++	 1335,  1413,  1489,  1565,  1641,  1716,  1790,  1863,  1936,  2008,  2079,  2150,  2219,  2289,  2357,  2425,
++	 2492,  2558,  2624,  2689,  2753,  2817,  2880,  2942,  3004,  3065,  3125,  3184,  3243,  3301,  3358,  3415,
++	 3471,  3526,  3581,  3635,  3688,  3740,  3792,  3843,  3894,  3943,  3992,  4041,  4088,  4135,  4182,  4227,
++	 4272,  4316,  4360,  4402,  4444,  4486,  4526,  4566,  4606,  4644,  4682,  4719,  4756,  4792,  4827,  4861,
++	 4895,  4928,  4960,  4992,  5023,  5053,  5083,  5112,  5140,  5167,  5194,  5220,  5245,  5270,  5294,  5317,
++	 5340,  5362,  5383,  5404,  5423,  5443,  5461,  5479,  5496,  5512,  5528,  5543,  5557,  5570,  5583,  5596,
++	 5607,  5618,  5628,  5637,  5646,  5654,  5661,  5668,  5674,  5679,  5683,  5687,  5690,  5693,  5695,  5696,
++	 5696,  5696,  5695,  5693,  5690,  5687,  5683,  5679,  5674,  5668,  5661,  5654,  5646,  5637,  5628,  5618,
++	 5607,  5596,  5583,  5570,  5557,  5543,  5528,  5512,  5496,  5479,  5461,  5443,  5423,  5404,  5383,  5362,
++	 5340,  5317,  5294,  5270,  5245,  5220,  5194,  5167,  5140,  5112,  5083,  5053,  5023,  4992,  4960,  4928,
++	 4895,  4861,  4827,  4792,  4756,  4719,  4682,  4644,  4606,  4566,  4526,  4486,  4444,  4402,  4360,  4316,
++	 4272,  4227,  4182,  4135,  4088,  4041,  3992,  3943,  3894,  3843,  3792,  3740,  3688,  3635,  3581,  3526,
++	 3471,  3415,  3358,  3301,  3243,  3184,  3125,  3065,  3004,  2942,  2880,  2817,  2753,  2689,  2624,  2558,
++	 2492,  2425,  2357,  2289,  2219,  2150,  2079,  2008,  1936,  1863,  1790,  1716,  1641,  1565,  1489,  1413,
++	 1335,  1257,  1178,  1098,  1018,   937,   855,   773,   690,   606,   521,   436,   350,   264,   177,    89,
++};
++
++static const u16 rfx_dec_corr_lut[256] = {
++	    0,    88,   175,   261,   346,   431,   516,   599,   682,   764,   846,   926,  1006,  1086,  1165,  1243,
++	 1320,  1397,  1473,  1548,  1622,  1696,  1770,  1842,  1914,  1985,  2056,  2125,  2194,  2263,  2331,  2398,
++	 2464,  2530,  2595,  2659,  2722,  2785,  2848,  2909,  2970,  3030,  3090,  3148,  3206,  3264,  3321,  3377,
++	 3432,  3487,  3541,  3594,  3646,  3698,  3750,  3800,  3850,  3899,  3948,  3995,  4042,  4089,  4135,  4180,
++	 4224,  4268,  4311,  4353,  4394,  4435,  4476,  4515,  4554,  4592,  4630,  4666,  4702,  4738,  4773,  4807,
++	 4840,  4873,  4905,  4936,  4966,  4996,  5026,  5054,  5082,  5109,  5136,  5161,  5186,  5211,  5235,  5258,
++	 5280,  5302,  5323,  5343,  5362,  5381,  5400,  5417,  5434,  5450,  5466,  5480,  5494,  5508,  5521,  5533,
++	 5544,  5555,  5565,  5574,  5582,  5590,  5598,  5604,  5610,  5615,  5620,  5623,  5626,  5629,  5631,  5632,
++	 5632,  5632,  5631,  5629,  5626,  5623,  5620,  5615,  5610,  5604,  5598,  5590,  5582,  5574,  5565,  5555,
++	 5544,  5533,  5521,  5508,  5494,  5480,  5466,  5450,  5434,  5417,  5400,  5381,  5362,  5343,  5323,  5302,
++	 5280,  5258,  5235,  5211,  5186,  5161,  5136,  5109,  5082,  5054,  5026,  4996,  4966,  4936,  4905,  4873,
++	 4840,  4807,  4773,  4738,  4702,  4666,  4630,  4592,  4554,  4515,  4476,  4435,  4394,  4353,  4311,  4268,
++	 4224,  4180,  4135,  4089,  4042,  3995,  3948,  3899,  3850,  3800,  3750,  3698,  3646,  3594,  3541,  3487,
++	 3432,  3377,  3321,  3264,  3206,  3148,  3090,  3030,  2970,  2909,  2848,  2785,  2722,  2659,  2595,  2530,
++	 2464,  2398,  2331,  2263,  2194,  2125,  2056,  1985,  1914,  1842,  1770,  1696,  1622,  1548,  1473,  1397,
++	 1320,  1243,  1165,  1086,  1006,   926,   846,   764,   682,   599,   516,   431,   346,   261,   175,    88,
++};
++
++/*
++ * rfx_lin_to_log - convert u32 to corrected log32fpmax (Q5.26)
++ *
++ * Specialized from intfp u32_to_log32fpmax_corr().
++ */
++static inline s32 rfx_lin_to_log(u32 v)
++{
++	u8 clz;
++	u32 m, mf;
++	u8 idx;
++
++	if (!v)
++		return RFX_LOG_0;
++
++	clz = __builtin_clz(v);
++	m = (v << clz) >> (32 - 1 - RFX_LOG_OFP);
++	mf = m & ((1U << RFX_LOG_OFP) - 1);
++	idx = (u8)(mf >> (RFX_LOG_OFP - 8));
++	m += (u32)rfx_enc_corr_lut[idx] << (RFX_LOG_OFP - 16);
++
++	return (s32)(((u32)(30 - clz) << RFX_LOG_OFP) + m);
++}
++
++/*
++ * rfx_log_to_lin - convert corrected log32fpmax (Q5.26) back to u32
++ *
++ * Specialized from intfp log32fpmax_to_u32_corr().
++ */
++static inline u32 rfx_log_to_lin(s32 v)
++{
++	bool negative;
++	s32 e;
++	u32 m, norm, mh;
++	u8 idx;
++
++	if (v == RFX_LOG_0)
++		return 0;
++
++	negative = v < 0;
++	if (negative)
++		v = -v;
++	e = v >> RFX_LOG_OFP;
++	if (negative)
++		e = -e;
++
++	if (e < 0)
++		return 0;
++	if (e >= 32)
++		return U32_MAX;
++
++	m = v & ((1U << RFX_LOG_OFP) - 1);
++	norm = (1U << 31) | (m << (31 - RFX_LOG_OFP));
++	mh = m << (31 - RFX_LOG_OFP);
++	idx = (u8)(mh >> (31 - 8));
++	norm -= (u32)rfx_dec_corr_lut[idx] << (31 - 16);
++
++	return norm >> (31 - e);
++}
 +
 +/************************ Governor internals ***********************/
 +
@@ -311,7 +421,8 @@ index 0000000000..be8da09e79
 + */
 +static void rfx_update_busy_pct(struct rfx_cpu *rfx_c,
 +				unsigned int window_us,
-+				unsigned int filter_shift, u64 time)
++				unsigned int filter_shift, u64 time,
++				unsigned long max_cap)
 +{
 +	u64 cur_idle, cur_wall;
 +	unsigned int wall_delta, idle_delta;
@@ -389,41 +500,43 @@ index 0000000000..be8da09e79
 +		rfx_c->hispeed_idle_windows = 0;
 +		if (!rfx_c->hispeed_start_ns)
 +			rfx_c->hispeed_start_ns = time;
++		rfx_c->log_hispeed = rfx_lin_to_log(
++			max_cap * rfx_c->filtered_busy_pct / 100);
 +	} else {
 +		rfx_c->hispeed_idle_windows++;
 +		if (rfx_c->hispeed_idle_windows >= 2) {
 +			rfx_c->hispeed_start_ns = 0;
 +			rfx_c->filtered_busy_pct = 0;
++			rfx_c->log_hispeed = RFX_LOG_0;
 +		}
 +	}
 +}
 +
 +/*
 + * Blend PELT utilization with hispeed utilization using PELT-complementary
-+ * exponential decay.
++ * continuous exponential decay.
 + *
-+ *   w = 2^(-half_lives)          [decays with PELT's 32 ms half-life]
-+ *   blended = pelt + w × (hispeed - pelt)
-+ *           = pelt + (hispeed - pelt) >> half_lives
++ * The hispeed contribution decays in log-domain at 1 ms granularity
++ * using PELT's 32 ms half-life (y = 2^(-1/32) per ms):
 + *
-+ * hispeed_util = max_cap × filtered_busy_pct / 100  [EWMA-filtered]
++ *   hispeed_decayed = 2^(log_hispeed + elapsed_ms × log2(y))
++ *   blended = min(pelt + hispeed_decayed, hispeed_util)
 + *
-+ * This ensures that at any point in time:
-+ *
-+ *   PELT coverage + hispeed coverage ≈ 100%
++ * By decaying hispeed_util directly (not the gap hispeed−pelt), the
++ * sum pelt + hispeed_decayed matches actual utilization as PELT ramps
++ * up, avoiding the double-decay artifact of the previous formulation.
 + *
 + * When hispeed_util <= pelt_util, hispeed is transparent.
-+ * After 10 half-lives (320 ms), the hispeed contribution is negligible.
++ * After 320 ms (10 half-lives), the hispeed contribution is negligible.
 + */
-+#define HISPEED_HALFLIFE_NS	(32 * NSEC_PER_MSEC)
-+
 +static unsigned long rfx_blend_util(struct rfx_cpu *rfx_c,
 +				    unsigned long pelt_util,
 +				    unsigned long max_cap,
 +				    u64 time)
 +{
-+	unsigned long hispeed_util;
-+	unsigned int half_lives;
++	unsigned long hispeed_util, hispeed_decayed;
++	unsigned int elapsed_ms;
++	s32 log_decayed;
 +
 +	if (!rfx_c->filtered_busy_pct || !rfx_c->hispeed_start_ns)
 +		return pelt_util;
@@ -433,13 +546,19 @@ index 0000000000..be8da09e79
 +	if (hispeed_util <= pelt_util)
 +		return pelt_util;
 +
-+	half_lives = (unsigned int)((time - rfx_c->hispeed_start_ns)
-+				    / HISPEED_HALFLIFE_NS);
-+	if (half_lives >= 10)
++	elapsed_ms = (unsigned int)((time - rfx_c->hispeed_start_ns)
++				    / NSEC_PER_MSEC);
++	if (elapsed_ms >= RFX_LOG_DECAY_MAX_MS)
 +		return pelt_util;
 +
-+	return min(pelt_util + ((hispeed_util - pelt_util) >> half_lives),
-+		   max_cap);
++	log_decayed = rfx_c->log_hispeed +
++		      (s32)elapsed_ms * RFX_LOG_DECAY_PER_MS;
++	hispeed_decayed = rfx_log_to_lin(log_decayed);
++
++	if (hispeed_decayed <= pelt_util)
++		return pelt_util;
++
++	return min(pelt_util + hispeed_decayed, hispeed_util);
 +}
 +
 +/************************ I/O wait boost ***********************/
@@ -563,7 +682,7 @@ index 0000000000..be8da09e79
 +
 +	/* Blend PELT util with hispeed util (decayed by PELT half-life) */
 +	rfx_update_busy_pct(rfx_c, tunables->hispeed_window_us,
-+			    tunables->hispeed_filter_shift, time);
++			    tunables->hispeed_filter_shift, time, max_cap);
 +	effective_util = rfx_blend_util(rfx_c, effective_util, max_cap, time);
 +
 +	/* Proportional scaling (schedutil-identical) */
@@ -630,7 +749,7 @@ index 0000000000..be8da09e79
 +
 +	/* Blend PELT util with hispeed util (decayed by PELT half-life) */
 +	rfx_update_busy_pct(rfx_c, tunables->hispeed_window_us,
-+			    tunables->hispeed_filter_shift, time);
++			    tunables->hispeed_filter_shift, time, max_cap);
 +	rfx_c->util = rfx_blend_util(rfx_c, rfx_c->util, max_cap, time);
 +
 +	if (rfx_hold_freq(rfx_c) && rfx_c->util < prev_util)
@@ -663,7 +782,8 @@ index 0000000000..be8da09e79
 +		j_util = max(j_rfx_c->util, j_boost);
 +
 +		rfx_update_busy_pct(j_rfx_c, tunables->hispeed_window_us,
-+				    tunables->hispeed_filter_shift, time);
++				    tunables->hispeed_filter_shift, time,
++				    max_cap);
 +		j_util = rfx_blend_util(j_rfx_c, j_util, max_cap, time);
 +
 +		util = max(j_util, util);
