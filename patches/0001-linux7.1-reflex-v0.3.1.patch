@@ -1,7 +1,7 @@
-From e2f05d323c359e67fb4f690b2d16639d5969b0b2 Mon Sep 17 00:00:00 2001
+From efee2afef254d618eb5c407815f298ba2f79cff4 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 5 Apr 2026 07:31:35 +0900
-Subject: [PATCH] Reflex CPUFreq Governor v0.3.0r2
+Date: Fri, 1 May 2026 16:52:28 +0900
+Subject: [PATCH] linux7.1-reflex-v0.3.1
 
 ---
  arch/x86/kernel/cpu/aperfmperf.c |    1 +
@@ -18,10 +18,10 @@ Subject: [PATCH] Reflex CPUFreq Governor v0.3.0r2
  create mode 100644 drivers/cpufreq/cpufreq_reflex.c
 
 diff --git a/arch/x86/kernel/cpu/aperfmperf.c b/arch/x86/kernel/cpu/aperfmperf.c
-index a315b0627d..8983df1106 100644
+index 7ffc78d5eb..4271bcc71f 100644
 --- a/arch/x86/kernel/cpu/aperfmperf.c
 +++ b/arch/x86/kernel/cpu/aperfmperf.c
-@@ -84,6 +84,7 @@ static void init_counter_refs(void)
+@@ -84,6 +84,7 @@ static void init_counter_refs(void *data)
   */
  
  DEFINE_STATIC_KEY_FALSE(arch_scale_freq_key);
@@ -30,10 +30,10 @@ index a315b0627d..8983df1106 100644
  static u64 arch_turbo_freq_ratio = SCHED_CAPACITY_SCALE;
  static u64 arch_max_freq_ratio = SCHED_CAPACITY_SCALE;
 diff --git a/drivers/cpufreq/Kconfig b/drivers/cpufreq/Kconfig
-index 78702a0836..3a94ff5621 100644
+index db83f33656..65c7f4918e 100644
 --- a/drivers/cpufreq/Kconfig
 +++ b/drivers/cpufreq/Kconfig
-@@ -203,6 +203,30 @@ config CPU_FREQ_GOV_SCHEDUTIL
+@@ -202,6 +202,30 @@ config CPU_FREQ_GOV_SCHEDUTIL
  
  	  If in doubt, say N.
  
@@ -65,7 +65,7 @@ index 78702a0836..3a94ff5621 100644
  
  config CPUFREQ_DT
 diff --git a/drivers/cpufreq/Makefile b/drivers/cpufreq/Makefile
-index 681d687b5a..f366c61072 100644
+index 385c9fcc65..4e369f8eb7 100644
 --- a/drivers/cpufreq/Makefile
 +++ b/drivers/cpufreq/Makefile
 @@ -13,6 +13,7 @@ obj-$(CONFIG_CPU_FREQ_GOV_ONDEMAND)	+= cpufreq_ondemand.o
@@ -77,10 +77,10 @@ index 681d687b5a..f366c61072 100644
  obj-$(CONFIG_CPUFREQ_DT)		+= cpufreq-dt.o
  obj-$(CONFIG_CPUFREQ_DT_RUST)		+= rcpufreq_dt.o
 diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
-index 852e024fac..a73a87fbca 100644
+index 44eb1b7e7f..323cdcf020 100644
 --- a/drivers/cpufreq/cpufreq.c
 +++ b/drivers/cpufreq/cpufreq.c
-@@ -2045,6 +2045,7 @@ bool cpufreq_driver_test_flags(u16 flags)
+@@ -2044,6 +2044,7 @@ bool cpufreq_driver_test_flags(u16 flags)
  {
  	return !!(cpufreq_driver->flags & flags);
  }
@@ -88,15 +88,15 @@ index 852e024fac..a73a87fbca 100644
  
  /**
   * cpufreq_get_current_driver - Return the current driver's name.
-@@ -2248,6 +2249,7 @@ void cpufreq_driver_adjust_perf(unsigned int cpu,
+@@ -2247,6 +2248,7 @@ void cpufreq_driver_adjust_perf(struct cpufreq_policy *policy,
  {
- 	cpufreq_driver->adjust_perf(cpu, min_perf, target_perf, capacity);
+ 	cpufreq_driver->adjust_perf(policy, min_perf, target_perf, capacity);
  }
 +EXPORT_SYMBOL_GPL(cpufreq_driver_adjust_perf);
  
  /**
   * cpufreq_driver_has_adjust_perf - Check "direct fast switch" callback.
-@@ -2259,6 +2261,7 @@ bool cpufreq_driver_has_adjust_perf(void)
+@@ -2258,6 +2260,7 @@ bool cpufreq_driver_has_adjust_perf(void)
  {
  	return !!cpufreq_driver->adjust_perf;
  }
@@ -106,7 +106,7 @@ index 852e024fac..a73a87fbca 100644
  static int __target_intermediate(struct cpufreq_policy *policy,
 diff --git a/drivers/cpufreq/cpufreq_reflex.c b/drivers/cpufreq/cpufreq_reflex.c
 new file mode 100644
-index 0000000000..68440141a4
+index 0000000000..ddccb901e5
 --- /dev/null
 +++ b/drivers/cpufreq/cpufreq_reflex.c
 @@ -0,0 +1,1141 @@
@@ -154,7 +154,7 @@ index 0000000000..68440141a4
 +#define CPUFREQ_REFLEX_PROGNAME "Reflex CPUFreq Governor"
 +#define CPUFREQ_REFLEX_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUFREQ_REFLEX_VERSION  "0.3.0"
++#define CPUFREQ_REFLEX_VERSION  "0.3.1"
 +
 +/**************************************************************
 + * Default tunables
@@ -755,7 +755,7 @@ index 0000000000..68440141a4
 +	if (rfx_hold_freq(rfx_c) && rfx_c->util < prev_util)
 +		rfx_c->util = prev_util;
 +
-+	cpufreq_driver_adjust_perf(rfx_c->cpu, rfx_c->bw_min,
++	cpufreq_driver_adjust_perf(rfx_pol->policy, rfx_c->bw_min,
 +				   rfx_c->util, max_cap);
 +
 +	rfx_pol->last_freq_update_time = time;
@@ -1274,10 +1274,10 @@ index bdd31ab93b..9496150882 100644
  
  #endif /* _LINUX_SCHED_CPUFREQ_H */
 diff --git a/kernel/kthread.c b/kernel/kthread.c
-index 31b072e8d4..d7d660972a 100644
+index 791210daf8..a250ab1b65 100644
 --- a/kernel/kthread.c
 +++ b/kernel/kthread.c
-@@ -618,6 +618,7 @@ void kthread_bind_mask(struct task_struct *p, const struct cpumask *mask)
+@@ -588,6 +588,7 @@ void kthread_bind_mask(struct task_struct *p, const struct cpumask *mask)
  	__kthread_bind_mask(p, mask, TASK_UNINTERRUPTIBLE);
  	WARN_ON_ONCE(kthread->started);
  }
@@ -1295,10 +1295,10 @@ index 742fb9e62e..5abbe2f17b 100644
  }
 +EXPORT_SYMBOL_GPL(cpufreq_this_cpu_can_update);
 diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
-index 0ab5f9d4bc..3b3387ab4f 100644
+index ae9fd211ce..a1d66273cf 100644
 --- a/kernel/sched/cpufreq_schedutil.c
 +++ b/kernel/sched/cpufreq_schedutil.c
-@@ -935,3 +935,79 @@ bool sugov_is_governor(struct cpufreq_policy *policy)
+@@ -936,3 +936,79 @@ bool sugov_is_governor(struct cpufreq_policy *policy)
  }
  
  cpufreq_governor_init(schedutil_gov);
@@ -1379,10 +1379,10 @@ index 0ab5f9d4bc..3b3387ab4f 100644
 +}
 +EXPORT_SYMBOL_GPL(cpufreq_scx_switched_all);
 diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
-index 466e083c82..23d1188578 100644
+index cbbb87a0c6..8501657277 100644
 --- a/kernel/time/tick-sched.c
 +++ b/kernel/time/tick-sched.c
-@@ -1384,6 +1384,7 @@ unsigned long tick_nohz_get_idle_calls_cpu(int cpu)
+@@ -1428,6 +1428,7 @@ unsigned long tick_nohz_get_idle_calls_cpu(int cpu)
  
  	return ts->idle_calls;
  }
