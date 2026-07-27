@@ -1,10 +1,11 @@
-From efee2afef254d618eb5c407815f298ba2f79cff4 Mon Sep 17 00:00:00 2001
+From 3a3078acdaa2401d0f2e12ec63ad967fd79b1c11 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Fri, 1 May 2026 16:52:28 +0900
-Subject: [PATCH] linux7.1-reflex-v0.3.1
+Date: Tue, 28 Jul 2026 02:30:19 +0900
+Subject: [PATCH] linux7.1-reflex-v0.3.2
 
 ---
  arch/x86/kernel/cpu/aperfmperf.c |    1 +
+ drivers/base/arch_topology.c     |    1 +
  drivers/cpufreq/Kconfig          |   24 +
  drivers/cpufreq/Makefile         |    1 +
  drivers/cpufreq/cpufreq.c        |    3 +
@@ -14,7 +15,7 @@ Subject: [PATCH] linux7.1-reflex-v0.3.1
  kernel/sched/cpufreq.c           |    1 +
  kernel/sched/cpufreq_schedutil.c |   76 ++
  kernel/time/tick-sched.c         |    1 +
- 10 files changed, 1259 insertions(+)
+ 11 files changed, 1260 insertions(+)
  create mode 100644 drivers/cpufreq/cpufreq_reflex.c
 
 diff --git a/arch/x86/kernel/cpu/aperfmperf.c b/arch/x86/kernel/cpu/aperfmperf.c
@@ -29,6 +30,18 @@ index 7ffc78d5eb..4271bcc71f 100644
  
  static u64 arch_turbo_freq_ratio = SCHED_CAPACITY_SCALE;
  static u64 arch_max_freq_ratio = SCHED_CAPACITY_SCALE;
+diff --git a/drivers/base/arch_topology.c b/drivers/base/arch_topology.c
+index 8c5e47c28d..1947cebed1 100644
+--- a/drivers/base/arch_topology.c
++++ b/drivers/base/arch_topology.c
+@@ -49,6 +49,7 @@ bool topology_scale_freq_invariant(void)
+ 	return cpufreq_supports_freq_invariance() ||
+ 	       supports_scale_freq_counters(cpu_online_mask);
+ }
++EXPORT_SYMBOL_GPL(topology_scale_freq_invariant);
+ 
+ static void update_scale_freq_invariant(bool status)
+ {
 diff --git a/drivers/cpufreq/Kconfig b/drivers/cpufreq/Kconfig
 index db83f33656..65c7f4918e 100644
 --- a/drivers/cpufreq/Kconfig
@@ -106,7 +119,7 @@ index 44eb1b7e7f..323cdcf020 100644
  static int __target_intermediate(struct cpufreq_policy *policy,
 diff --git a/drivers/cpufreq/cpufreq_reflex.c b/drivers/cpufreq/cpufreq_reflex.c
 new file mode 100644
-index 0000000000..ddccb901e5
+index 0000000000..bcd51a65cd
 --- /dev/null
 +++ b/drivers/cpufreq/cpufreq_reflex.c
 @@ -0,0 +1,1141 @@
@@ -154,7 +167,7 @@ index 0000000000..ddccb901e5
 +#define CPUFREQ_REFLEX_PROGNAME "Reflex CPUFreq Governor"
 +#define CPUFREQ_REFLEX_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUFREQ_REFLEX_VERSION  "0.3.1"
++#define CPUFREQ_REFLEX_VERSION  "0.3.2"
 +
 +/**************************************************************
 + * Default tunables
