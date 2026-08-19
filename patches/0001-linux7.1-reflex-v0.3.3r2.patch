@@ -1,7 +1,7 @@
-From 447f8ca4f4a1f9d1cfc2a82d580a92853f63396b Mon Sep 17 00:00:00 2001
+From 632e46ce275ca0707269ce5909f123bc01cad7fb Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Thu, 20 Aug 2026 00:49:08 +0900
-Subject: [PATCH] linux7.1-reflex-v0.3.3
+Subject: [PATCH] linux7.1-reflex-v0.3.3r2
 
 ---
  arch/x86/kernel/cpu/aperfmperf.c |    1 +
@@ -119,7 +119,7 @@ index 44eb1b7e7f..323cdcf020 100644
  static int __target_intermediate(struct cpufreq_policy *policy,
 diff --git a/drivers/cpufreq/cpufreq_reflex.c b/drivers/cpufreq/cpufreq_reflex.c
 new file mode 100644
-index 0000000000..50b11af528
+index 0000000000..31a317ec9e
 --- /dev/null
 +++ b/drivers/cpufreq/cpufreq_reflex.c
 @@ -0,0 +1,1160 @@
@@ -455,7 +455,7 @@ index 0000000000..50b11af528
 +	 * by at most one callback.
 +	 */
 +	if (!rfx_c->hispeed_active) {
-+		if (ktime_get_us() - rfx_c->prev_wall_time < window_us)
++		if (ktime_to_us(ktime_get()) - rfx_c->prev_wall_time < window_us)
 +			return;
 +	}
 +
